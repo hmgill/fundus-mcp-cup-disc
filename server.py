@@ -32,7 +32,7 @@ mcp = FastMCP("fundus-cup-disc")
 
 MODEL_ID     = "pamixsun/segformer_for_optic_disc_cup_segmentation"
 WEIGHTS_DIR  = Path(__file__).parent / "weights"
-WEIGHTS_FILE = WEIGHTS_DIR / "cup-disc.safetensors"
+WEIGHTS_FILE = WEIGHTS_DIR / "model.safetensors"
 
 # ---------------------------------------------------------------------------
 # Lazy model loader
