@@ -8,7 +8,7 @@ Weights are committed to the repo via Git LFS and loaded from
 the ./weights/ directory at startup. No download required.
 
 Tools:
-    segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ
+    segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ  [background task]
     health()                              → liveness check
 """
 
@@ -18,9 +18,12 @@ import base64
 import io
 import json
 import logging
+from datetime import timedelta
 from pathlib import Path
 
 from fastmcp import FastMCP
+from fastmcp.dependencies import Progress
+from fastmcp.server.tasks import TaskConfig
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,8 +79,12 @@ mcp = FastMCP("fundus-cup-disc")
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def segment_cup_disc(image_b64: str, image_id: str) -> str:
+@mcp.tool(task=TaskConfig(mode="required", poll_interval=timedelta(seconds=5)))
+async def segment_cup_disc(
+    image_b64: str,
+    image_id: str,
+    progress: Progress = Progress(),
+) -> str:
     """
     Run SegFormer optic cup and disc segmentation on a fundus image.
 
@@ -101,18 +108,26 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     from datetime import datetime
 
     try:
+        await progress.set_total(3)
+
+        await progress.set_message("Loading model...")
         model, processor, device = _get_model()
 
+        await progress.set_message("Preprocessing image...")
         img_bytes = base64.b64decode(image_b64)
         image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w, h      = image.size
 
         inputs = processor(image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        await progress.increment()
 
+        await progress.set_message("Running segmentation inference...")
         with torch.no_grad():
             logits = model(**inputs).logits
+        await progress.increment()
 
+        await progress.set_message("Computing mask statistics...")
         upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
                                   align_corners=False)
         cd_raw    = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
@@ -138,6 +153,7 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
             "created_at":            datetime.utcnow().isoformat() + "Z",
         })
         logger.info(f"Response payload size: {len(payload)} bytes ({len(payload)/1024:.1f} KB)")
+        await progress.increment()
         return payload
 
     except Exception as e:
