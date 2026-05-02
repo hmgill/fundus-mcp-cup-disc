@@ -100,42 +100,49 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     from PIL import Image as _Image
     from datetime import datetime
 
-    model, processor, device = _get_model()
+    try:
+        model, processor, device = _get_model()
 
-    img_bytes = base64.b64decode(image_b64)
-    image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    w, h      = image.size
+        img_bytes = base64.b64decode(image_b64)
+        image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h      = image.size
 
-    inputs = processor(image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = processor(image, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
-        logits = model(**inputs).logits
+        with torch.no_grad():
+            logits = model(**inputs).logits
 
-    upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
-                              align_corners=False)
-    cd_raw    = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
+                                  align_corners=False)
+        cd_raw    = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
 
-    disc_annulus = (cd_raw == 1).astype(np.uint8)
-    cup          = (cd_raw == 2).astype(np.uint8)
-    full_disc    = (cd_raw >= 1).astype(np.uint8)
+        disc_annulus = (cd_raw == 1).astype(np.uint8)
+        cup          = (cd_raw == 2).astype(np.uint8)
+        full_disc    = (cd_raw >= 1).astype(np.uint8)
 
-    cup_px  = int(cup.sum())
-    disc_px = int(full_disc.sum())
-    cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
+        cup_px  = int(cup.sum())
+        disc_px = int(full_disc.sum())
+        cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
 
-    return json.dumps({
-        "success":               True,
-        "image_id":              image_id,
-        "shape":                 list(cd_raw.shape),
-        "disc_pixel_count":      int(disc_annulus.sum()),
-        "cup_pixel_count":       cup_px,
-        "full_disc_pixel_count": disc_px,
-        "cdr":                   cdr,
-        "masks_b64":             "DUMMY",   # TODO: re-enable once payload size confirmed OK
-        "model":                 str(WEIGHTS_FILE.name),
-        "created_at":            datetime.utcnow().isoformat() + "Z",
-    })
+        payload = json.dumps({
+            "success":               True,
+            "image_id":              image_id,
+            "shape":                 list(cd_raw.shape),
+            "disc_pixel_count":      int(disc_annulus.sum()),
+            "cup_pixel_count":       cup_px,
+            "full_disc_pixel_count": disc_px,
+            "cdr":                   cdr,
+            "masks_b64":             "DUMMY",   # TODO: re-enable once payload size confirmed OK
+            "model":                 str(WEIGHTS_FILE.name),
+            "created_at":            datetime.utcnow().isoformat() + "Z",
+        })
+        logger.info(f"Response payload size: {len(payload)} bytes ({len(payload)/1024:.1f} KB)")
+        return payload
+
+    except Exception as e:
+        logger.error(f"segment_cup_disc failed: {e}", exc_info=True)
+        return json.dumps({"success": False, "error": str(e), "image_id": image_id})
 
 
 @mcp.tool()
