@@ -2,22 +2,26 @@
 server.py — fundus-mcp-cup-disc
 ================================
 FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
-for deployment on Prefect Horizon (AWS Lambda via lambda_http).
+for deployment on Prefect Horizon (stateless HTTP, multi-process).
 
-Key architecture notes:
-  - Prefect Horizon forks worker processes AFTER module import, so module-level
-    _get_model() calls populate a cache that is NOT visible in the worker.
-  - Model loading must happen inside the FastMCP lifespan context, which runs
-    inside the worker after fork, before any tool calls are served.
-  - A dummy inference pass during lifespan forces all lazy PyTorch allocations
-    (cuDNN benchmarks, kernel compilation, etc.) before the first real request.
-  - Lambda timeout: if model load + dummy inference exceeds the function timeout,
-    increase it in the Prefect Horizon deployment config (recommend >=60s).
+Architecture reality on Prefect Horizon / stateless Lambda:
+  - Multiple worker processes start in parallel at cold start.
+  - Each process independently imports this module and runs module-level code.
+  - Stateless HTTP means each request MAY land in a different process.
+  - _model_cache dicts are NOT shared across processes.
+
+Strategy:
+  1. Module-level load: each worker loads the model into its own _model_cache.
+     With multiple workers, this is concurrent but each worker only loads once.
+  2. /tmp torch checkpoint cache: after the first full safetensors parse (~20s),
+     the state_dict is saved to /tmp/segformer_cached.pt. Subsequent workers
+     load from /tmp (~2-3s) instead of re-parsing safetensors (~20s).
+  3. Dummy inference warm-up: forces cuDNN kernel selection before requests.
+  4. Lifespan context: re-checks cache and loads if somehow missed at import.
 
 Lambda constraints:
   - Synchronous response limit: 6 MB
-  - NPZ masks disabled by default; set ENABLE_MASKS=1 env var to enable.
-  - MAX_RESPONSE_BYTES: 4 MB hard cap (leaves headroom below 6 MB limit).
+  - NPZ masks off by default; set ENABLE_MASKS=1 env var to enable.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import io
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -45,81 +50,122 @@ logger = logging.getLogger(__name__)
 
 WEIGHTS_DIR        = Path(__file__).parent / "weights"
 WEIGHTS_FILE       = WEIGHTS_DIR / "model.safetensors"
+TMP_CACHE_PT       = Path("/tmp/segformer_cached.pt")   # fast re-load path
 ENABLE_MASKS       = os.environ.get("ENABLE_MASKS", "0") == "1"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # 4 MB — headroom below Lambda 6 MB limit
 
-# Shared state populated during lifespan (inside the worker process after fork)
-_STATE: dict[str, Any] = {}
+_model_cache: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
-# Model loader (called from lifespan, inside the worker)
+# Model loader with /tmp checkpoint cache
 # ---------------------------------------------------------------------------
 
 def _load_model() -> None:
-    """Load SegFormer into _STATE. Must be called from inside the worker process."""
+    """
+    Load SegFormer into _model_cache.
+
+    Load order (fastest first):
+      1. Already in _model_cache — no-op.
+      2. /tmp/segformer_cached.pt exists — load state_dict in ~2s.
+      3. weights/model.safetensors — full parse ~20s, then save to /tmp.
+    """
+    if "model" in _model_cache:
+        return
+
     import torch
     from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
     import numpy as np
 
     if not WEIGHTS_FILE.exists():
         raise FileNotFoundError(
-            f"Model weights not found: {WEIGHTS_FILE}\n"
-            f"Ensure weights/model.safetensors is committed via Git LFS."
+            f"Weights not found: {WEIGHTS_FILE}. "
+            "Ensure weights/model.safetensors is committed via Git LFS."
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Loading SegFormer from {WEIGHTS_DIR} on {device} ...")
 
+    # Always load processor from config (tiny, fast)
     processor = AutoImageProcessor.from_pretrained(
         str(WEIGHTS_DIR), local_files_only=True,
     )
-    model = SegformerForSemanticSegmentation.from_pretrained(
-        str(WEIGHTS_DIR), local_files_only=True,
-    ).to(device)
+
+    if TMP_CACHE_PT.exists():
+        # Fast path: load pre-parsed state_dict from /tmp (~2-3s)
+        logger.info(f"Loading SegFormer state_dict from /tmp cache ({TMP_CACHE_PT}) ...")
+        t0 = time.time()
+        try:
+            model = SegformerForSemanticSegmentation.from_pretrained(
+                str(WEIGHTS_DIR), local_files_only=True,
+                state_dict=torch.load(str(TMP_CACHE_PT), map_location=device),
+            )
+        except Exception as e:
+            logger.warning(f"/tmp cache load failed ({e}), falling back to safetensors")
+            TMP_CACHE_PT.unlink(missing_ok=True)
+            return _load_model()   # recursive retry via slow path
+        logger.info(f"Loaded from /tmp cache in {time.time()-t0:.1f}s")
+    else:
+        # Slow path: parse safetensors (~20s), then cache to /tmp
+        logger.info(f"Loading SegFormer from safetensors ({WEIGHTS_FILE}) ...")
+        t0 = time.time()
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            str(WEIGHTS_DIR), local_files_only=True,
+        )
+        elapsed = time.time() - t0
+        logger.info(f"Safetensors parsed in {elapsed:.1f}s. Saving to /tmp cache ...")
+        try:
+            torch.save(model.state_dict(), str(TMP_CACHE_PT))
+            logger.info(f"Saved to {TMP_CACHE_PT} ({TMP_CACHE_PT.stat().st_size // 1024 // 1024} MB)")
+        except Exception as e:
+            logger.warning(f"Could not save /tmp cache: {e} (will re-parse next time)")
+
+    model = model.to(device)
     model.eval()
 
-    _STATE["model"]     = model
-    _STATE["processor"] = processor
-    _STATE["device"]    = device
-    logger.info(f"SegFormer loaded on {device}.")
-
-    # Dummy inference: forces cuDNN kernel selection + lazy allocs before first request
-    logger.info("Running dummy inference warm-up (64x64 black image)...")
+    # Dummy inference warm-up — forces lazy PyTorch/cuDNN allocations
+    logger.info("Dummy warm-up inference (64x64) ...")
     from PIL import Image as _Image
     dummy  = _Image.fromarray(np.zeros((64, 64, 3), dtype="uint8"))
     inputs = processor(dummy, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         _ = model(**inputs).logits
-    logger.info("Warm-up complete. Worker ready.")
+
+    _model_cache["model"]     = model
+    _model_cache["processor"] = processor
+    _model_cache["device"]    = device
+    logger.info(f"SegFormer ready on {device}. PID={os.getpid()}")
 
 
 # ---------------------------------------------------------------------------
-# FastMCP lifespan — runs inside the worker process after fork
+# Module-level load — runs in each worker at import time
+# ---------------------------------------------------------------------------
+
+try:
+    logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
+    _load_model()
+except Exception as _e:
+    logger.error(f"Module-level model load failed: {_e}", exc_info=True)
+    _model_cache["load_error"] = str(_e)
+
+
+# ---------------------------------------------------------------------------
+# FastMCP lifespan — safety net in case import-time load was skipped/failed
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastMCP):
-    """Load model during worker startup; clean up on shutdown."""
-    logger.info("=== Worker lifespan startup: loading model ===")
-    try:
-        _load_model()
-    except Exception as e:
-        logger.error(f"Model load failed during lifespan: {e}", exc_info=True)
-        _STATE["load_error"] = str(e)
-    yield
-    # Shutdown: free GPU memory
-    if "model" in _STATE:
+    if "model" not in _model_cache:
+        logger.info(f"Lifespan: model not in cache, loading now (PID={os.getpid()}) ...")
         try:
-            import torch
-            del _STATE["model"]
-            del _STATE["processor"]
-            if str(_STATE.get("device", "cpu")) != "cpu":
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-    logger.info("=== Worker lifespan shutdown complete ===")
+            _load_model()
+        except Exception as e:
+            logger.error(f"Lifespan model load failed: {e}", exc_info=True)
+            _model_cache["load_error"] = str(e)
+    else:
+        logger.info(f"Lifespan: model already loaded (PID={os.getpid()}), skipping.")
+    yield
+    logger.info(f"Lifespan shutdown (PID={os.getpid()}).")
 
 
 # ---------------------------------------------------------------------------
@@ -144,18 +190,14 @@ async def segment_cup_disc(
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
-                    Resize to <=512x512 before encoding to keep payload small.
-        image_id:   Identifier for this image (echoed in the result JSON).
+                    Resize to <=512x512 before encoding.
+        image_id:   Identifier string echoed in the result JSON.
 
     Returns:
-        JSON string with disc/cup pixel counts, CDR, image shape, and
-        optionally a base64-encoded NPZ (only when ENABLE_MASKS=1 env var
-        is set and the payload stays under MAX_RESPONSE_BYTES).
+        JSON with disc/cup pixel counts, CDR, shape, and optionally NPZ masks.
 
-    Label map (cd_raw array):
-        0 = background
-        1 = disc annulus (outer ring, excludes cup)
-        2 = optic cup
+    Label map:
+        0 = background | 1 = disc annulus | 2 = optic cup
     """
     import torch
     import torch.nn.functional as F
@@ -164,18 +206,21 @@ async def segment_cup_disc(
     from datetime import datetime
 
     try:
-        # Guard: model must have loaded during lifespan
-        if "model" not in _STATE:
-            load_error = _STATE.get("load_error", "unknown — check startup logs")
+        # Attempt lazy load if somehow still missing (should not happen normally)
+        if "model" not in _model_cache:
+            logger.warning(f"Model missing at tool call time (PID={os.getpid()}), loading now...")
+            _load_model()
+
+        if "model" not in _model_cache:
             return json.dumps({
                 "success":  False,
-                "error":    f"Model not loaded: {load_error}",
+                "error":    f"Model not loaded: {_model_cache.get('load_error', 'unknown')}",
                 "image_id": image_id,
             })
 
-        model     = _STATE["model"]
-        processor = _STATE["processor"]
-        device    = _STATE["device"]
+        model     = _model_cache["model"]
+        processor = _model_cache["processor"]
+        device    = _model_cache["device"]
 
         await progress.set_total(3)
 
@@ -184,7 +229,7 @@ async def segment_cup_disc(
         img_bytes = base64.b64decode(image_b64)
         image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w, h      = image.size
-        logger.info(f"[{image_id}] Input image: {w}x{h}")
+        logger.info(f"[{image_id}] Input: {w}x{h} PID={os.getpid()}")
 
         inputs = processor(image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -198,9 +243,7 @@ async def segment_cup_disc(
 
         # Step 3: post-process
         await progress.set_message("Computing mask statistics...")
-        upsampled = F.interpolate(
-            logits, size=(h, w), mode="bilinear", align_corners=False
-        )
+        upsampled    = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
         cd_raw       = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
         disc_annulus = (cd_raw == 1).astype(np.uint8)
         cup          = (cd_raw == 2).astype(np.uint8)
@@ -223,16 +266,12 @@ async def segment_cup_disc(
             "masks_included":        False,
         }
 
-        # Optional NPZ attachment
+        # Optional NPZ (gated by env var + size check)
         if ENABLE_MASKS:
             npz_buf = io.BytesIO()
-            np.savez_compressed(
-                npz_buf,
-                disc_annulus=disc_annulus,
-                cup=cup,
-                full_disc=full_disc,
-                cd_raw=cd_raw,
-            )
+            np.savez_compressed(npz_buf,
+                disc_annulus=disc_annulus, cup=cup,
+                full_disc=full_disc, cd_raw=cd_raw)
             npz_b64 = base64.b64encode(npz_buf.getvalue()).decode()
             probe   = json.dumps({**result, "masks_b64": npz_b64})
             if len(probe.encode()) <= MAX_RESPONSE_BYTES:
@@ -240,16 +279,10 @@ async def segment_cup_disc(
                 result["masks_included"] = True
                 logger.info(f"[{image_id}] NPZ included ({len(probe)//1024} KB)")
             else:
-                logger.warning(
-                    f"[{image_id}] NPZ payload {len(probe)//1024} KB exceeds "
-                    f"{MAX_RESPONSE_BYTES//1024} KB budget — masks omitted."
-                )
+                logger.warning(f"[{image_id}] NPZ {len(probe)//1024} KB > budget, omitted")
 
         payload = json.dumps(result)
-        logger.info(
-            f"[{image_id}] Done — {len(payload)//1024} KB | "
-            f"cup={cup_px}px disc={disc_px}px CDR={cdr}"
-        )
+        logger.info(f"[{image_id}] Done {len(payload)//1024}KB CDR={cdr} cup={cup_px} disc={disc_px}")
         await progress.increment()
         return payload
 
@@ -260,23 +293,22 @@ async def segment_cup_disc(
 
 @mcp.tool()
 async def health() -> str:
-    """
-    Liveness probe.
-    Returns model load status, device, weights path, and configuration.
-    If model_loaded=false, check load_error for the failure reason.
-    """
+    """Liveness probe — reports model load status, device, cache paths."""
     import torch
-    model_loaded = "model" in _STATE
     return json.dumps({
-        "status":         "ok",
-        "service":        "fundus-cup-disc",
-        "weights_file":   str(WEIGHTS_FILE),
-        "weights_exists": WEIGHTS_FILE.exists(),
-        "model_loaded":   model_loaded,
-        "load_error":     _STATE.get("load_error"),
-        "device":         str(_STATE.get("device", "not loaded")),
-        "masks_enabled":  ENABLE_MASKS,
-        "cuda_available": torch.cuda.is_available(),
+        "status":          "ok",
+        "service":         "fundus-cup-disc",
+        "pid":             os.getpid(),
+        "weights_file":    str(WEIGHTS_FILE),
+        "weights_exists":  WEIGHTS_FILE.exists(),
+        "tmp_cache":       str(TMP_CACHE_PT),
+        "tmp_cache_exists": TMP_CACHE_PT.exists(),
+        "tmp_cache_mb":    round(TMP_CACHE_PT.stat().st_size / 1024 / 1024, 1) if TMP_CACHE_PT.exists() else 0,
+        "model_loaded":    "model" in _model_cache,
+        "load_error":      _model_cache.get("load_error"),
+        "device":          str(_model_cache.get("device", "not loaded")),
+        "masks_enabled":   ENABLE_MASKS,
+        "cuda_available":  torch.cuda.is_available(),
     })
 
 
