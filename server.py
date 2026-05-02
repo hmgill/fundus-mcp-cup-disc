@@ -4,18 +4,20 @@ server.py — fundus-mcp-cup-disc
 FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
 for deployment on Prefect Horizon (AWS Lambda via lambda_http).
 
-Key constraints:
-  - Lambda synchronous response limit: 6 MB
-  - Lambda streaming response limit: 20 MB
-  - lambda_http panics on body write errors (OOM kills, timeout mid-write)
-  - NPZ masks are DISABLED by default; enable via ENABLE_MASKS=1 env var
+Key architecture notes:
+  - Prefect Horizon forks worker processes AFTER module import, so module-level
+    _get_model() calls populate a cache that is NOT visible in the worker.
+  - Model loading must happen inside the FastMCP lifespan context, which runs
+    inside the worker after fork, before any tool calls are served.
+  - A dummy inference pass during lifespan forces all lazy PyTorch allocations
+    (cuDNN benchmarks, kernel compilation, etc.) before the first real request.
+  - Lambda timeout: if model load + dummy inference exceeds the function timeout,
+    increase it in the Prefect Horizon deployment config (recommend >=60s).
 
-Weights are committed to the repo via Git LFS and loaded from
-the ./weights/ directory at startup. No download required.
-
-Tools:
-    segment_cup_disc(image_b64, image_id) → mask stats + optional base64 NPZ  [background task]
-    health()                              → liveness check
+Lambda constraints:
+  - Synchronous response limit: 6 MB
+  - NPZ masks disabled by default; set ENABLE_MASKS=1 env var to enable.
+  - MAX_RESPONSE_BYTES: 4 MB hard cap (leaves headroom below 6 MB limit).
 """
 
 from __future__ import annotations
@@ -25,8 +27,10 @@ import io
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
@@ -36,57 +40,93 @@ logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config & model loader
+# Config
 # ---------------------------------------------------------------------------
 
-WEIGHTS_DIR   = Path(__file__).parent / "weights"
-WEIGHTS_FILE  = WEIGHTS_DIR / "model.safetensors"
-ENABLE_MASKS  = os.environ.get("ENABLE_MASKS", "0") == "1"
+WEIGHTS_DIR        = Path(__file__).parent / "weights"
+WEIGHTS_FILE       = WEIGHTS_DIR / "model.safetensors"
+ENABLE_MASKS       = os.environ.get("ENABLE_MASKS", "0") == "1"
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # 4 MB — headroom below Lambda 6 MB limit
 
-# Lambda response size budget (leave headroom below the 6 MB sync limit)
-MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # 4 MB hard cap on serialized JSON
-
-_model_cache: dict = {}
+# Shared state populated during lifespan (inside the worker process after fork)
+_STATE: dict[str, Any] = {}
 
 
-def _get_model():
-    if "model" not in _model_cache:
-        import torch
-        from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+# ---------------------------------------------------------------------------
+# Model loader (called from lifespan, inside the worker)
+# ---------------------------------------------------------------------------
 
-        if not WEIGHTS_FILE.exists():
-            raise FileNotFoundError(f"Weights not found: {WEIGHTS_FILE}")
-        logger.info(f"Loading model from {WEIGHTS_DIR} ...")
-        device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        processor = AutoImageProcessor.from_pretrained(
-            str(WEIGHTS_DIR), local_files_only=True,
+def _load_model() -> None:
+    """Load SegFormer into _STATE. Must be called from inside the worker process."""
+    import torch
+    from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+    import numpy as np
+
+    if not WEIGHTS_FILE.exists():
+        raise FileNotFoundError(
+            f"Model weights not found: {WEIGHTS_FILE}\n"
+            f"Ensure weights/model.safetensors is committed via Git LFS."
         )
-        model = SegformerForSemanticSegmentation.from_pretrained(
-            str(WEIGHTS_DIR), local_files_only=True,
-        ).to(device)
-        model.eval()
-        _model_cache["model"]     = model
-        _model_cache["processor"] = processor
-        _model_cache["device"]    = device
-        logger.info(f"SegFormer ready on {device}.")
 
-    return _model_cache["model"], _model_cache["processor"], _model_cache["device"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Loading SegFormer from {WEIGHTS_DIR} on {device} ...")
+
+    processor = AutoImageProcessor.from_pretrained(
+        str(WEIGHTS_DIR), local_files_only=True,
+    )
+    model = SegformerForSemanticSegmentation.from_pretrained(
+        str(WEIGHTS_DIR), local_files_only=True,
+    ).to(device)
+    model.eval()
+
+    _STATE["model"]     = model
+    _STATE["processor"] = processor
+    _STATE["device"]    = device
+    logger.info(f"SegFormer loaded on {device}.")
+
+    # Dummy inference: forces cuDNN kernel selection + lazy allocs before first request
+    logger.info("Running dummy inference warm-up (64x64 black image)...")
+    from PIL import Image as _Image
+    dummy  = _Image.fromarray(np.zeros((64, 64, 3), dtype="uint8"))
+    inputs = processor(dummy, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        _ = model(**inputs).logits
+    logger.info("Warm-up complete. Worker ready.")
+
+
+# ---------------------------------------------------------------------------
+# FastMCP lifespan — runs inside the worker process after fork
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastMCP):
+    """Load model during worker startup; clean up on shutdown."""
+    logger.info("=== Worker lifespan startup: loading model ===")
+    try:
+        _load_model()
+    except Exception as e:
+        logger.error(f"Model load failed during lifespan: {e}", exc_info=True)
+        _STATE["load_error"] = str(e)
+    yield
+    # Shutdown: free GPU memory
+    if "model" in _STATE:
+        try:
+            import torch
+            del _STATE["model"]
+            del _STATE["processor"]
+            if str(_STATE.get("device", "cpu")) != "cpu":
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    logger.info("=== Worker lifespan shutdown complete ===")
 
 
 # ---------------------------------------------------------------------------
 # FastMCP app
 # ---------------------------------------------------------------------------
 
-# Pre-warm model at import time so cold-start penalty is paid once.
-logger.info("Pre-warming model at module import...")
-try:
-    _get_model()
-    logger.info("Model ready.")
-except Exception as e:
-    logger.error(f"Model pre-warm failed (will retry on first call): {e}")
-
-
-mcp = FastMCP("fundus-cup-disc")
+mcp = FastMCP("fundus-cup-disc", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -104,14 +144,13 @@ async def segment_cup_disc(
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
-                    Resize to ≤512×512 before encoding to stay within
-                    Lambda's 6 MB response limit.
-        image_id:   Identifier for this image (used in result JSON).
+                    Resize to <=512x512 before encoding to keep payload small.
+        image_id:   Identifier for this image (echoed in the result JSON).
 
     Returns:
         JSON string with disc/cup pixel counts, CDR, image shape, and
         optionally a base64-encoded NPZ (only when ENABLE_MASKS=1 env var
-        is set and the payload stays under 4 MB).
+        is set and the payload stays under MAX_RESPONSE_BYTES).
 
     Label map (cd_raw array):
         0 = background
@@ -125,33 +164,43 @@ async def segment_cup_disc(
     from datetime import datetime
 
     try:
+        # Guard: model must have loaded during lifespan
+        if "model" not in _STATE:
+            load_error = _STATE.get("load_error", "unknown — check startup logs")
+            return json.dumps({
+                "success":  False,
+                "error":    f"Model not loaded: {load_error}",
+                "image_id": image_id,
+            })
+
+        model     = _STATE["model"]
+        processor = _STATE["processor"]
+        device    = _STATE["device"]
+
         await progress.set_total(3)
 
-        # ── Step 1: load model ────────────────────────────────────────────
-        await progress.set_message("Loading model...")
-        model, processor, device = _get_model()
-        await progress.increment()
-
-        # ── Step 2: preprocess ────────────────────────────────────────────
+        # Step 1: decode & preprocess
         await progress.set_message("Preprocessing image...")
         img_bytes = base64.b64decode(image_b64)
         image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w, h      = image.size
-        logger.info(f"[{image_id}] Input image size: {w}x{h}")
+        logger.info(f"[{image_id}] Input image: {w}x{h}")
 
         inputs = processor(image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        await progress.increment()
 
-        # ── Step 3: inference ─────────────────────────────────────────────
+        # Step 2: inference
         await progress.set_message("Running segmentation inference...")
         with torch.no_grad():
             logits = model(**inputs).logits
         await progress.increment()
 
-        # ── Step 4: post-process ──────────────────────────────────────────
+        # Step 3: post-process
         await progress.set_message("Computing mask statistics...")
-        upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
-                                  align_corners=False)
+        upsampled = F.interpolate(
+            logits, size=(h, w), mode="bilinear", align_corners=False
+        )
         cd_raw       = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
         disc_annulus = (cd_raw == 1).astype(np.uint8)
         cup          = (cd_raw == 2).astype(np.uint8)
@@ -164,7 +213,7 @@ async def segment_cup_disc(
         result: dict = {
             "success":               True,
             "image_id":              image_id,
-            "shape":                 list(cd_raw.shape),   # [H, W]
+            "shape":                 list(cd_raw.shape),
             "disc_pixel_count":      int(disc_annulus.sum()),
             "cup_pixel_count":       cup_px,
             "full_disc_pixel_count": disc_px,
@@ -174,7 +223,7 @@ async def segment_cup_disc(
             "masks_included":        False,
         }
 
-        # Optionally attach NPZ — only if env var set AND payload fits in budget
+        # Optional NPZ attachment
         if ENABLE_MASKS:
             npz_buf = io.BytesIO()
             np.savez_compressed(
@@ -185,44 +234,47 @@ async def segment_cup_disc(
                 cd_raw=cd_raw,
             )
             npz_b64 = base64.b64encode(npz_buf.getvalue()).decode()
-            # Probe total payload size before committing
-            probe = json.dumps({**result, "masks_b64": npz_b64})
+            probe   = json.dumps({**result, "masks_b64": npz_b64})
             if len(probe.encode()) <= MAX_RESPONSE_BYTES:
-                result["masks_b64"]     = npz_b64
+                result["masks_b64"]      = npz_b64
                 result["masks_included"] = True
-                logger.info(f"[{image_id}] NPZ included ({len(probe)//1024} KB payload)")
+                logger.info(f"[{image_id}] NPZ included ({len(probe)//1024} KB)")
             else:
                 logger.warning(
                     f"[{image_id}] NPZ payload {len(probe)//1024} KB exceeds "
-                    f"{MAX_RESPONSE_BYTES//1024} KB budget — masks omitted. "
-                    "Reduce image size or increase MAX_RESPONSE_BYTES."
+                    f"{MAX_RESPONSE_BYTES//1024} KB budget — masks omitted."
                 )
 
         payload = json.dumps(result)
         logger.info(
-            f"[{image_id}] Response: {len(payload)//1024} KB | "
+            f"[{image_id}] Done — {len(payload)//1024} KB | "
             f"cup={cup_px}px disc={disc_px}px CDR={cdr}"
         )
         await progress.increment()
         return payload
 
     except Exception as e:
-        logger.error(f"segment_cup_disc failed for {image_id!r}: {e}", exc_info=True)
+        logger.error(f"segment_cup_disc failed [{image_id}]: {e}", exc_info=True)
         return json.dumps({"success": False, "error": str(e), "image_id": image_id})
 
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe — reports weights path and model load status."""
+    """
+    Liveness probe.
+    Returns model load status, device, weights path, and configuration.
+    If model_loaded=false, check load_error for the failure reason.
+    """
     import torch
-    model_loaded = "model" in _model_cache
+    model_loaded = "model" in _STATE
     return json.dumps({
         "status":         "ok",
         "service":        "fundus-cup-disc",
         "weights_file":   str(WEIGHTS_FILE),
         "weights_exists": WEIGHTS_FILE.exists(),
         "model_loaded":   model_loaded,
-        "device":         str(_model_cache.get("device", "not loaded")),
+        "load_error":     _STATE.get("load_error"),
+        "device":         str(_STATE.get("device", "not loaded")),
         "masks_enabled":  ENABLE_MASKS,
         "cuda_available": torch.cuda.is_available(),
     })
