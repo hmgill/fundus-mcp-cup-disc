@@ -30,8 +30,9 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("fundus-cup-disc")
 
-MODEL_ID  = "pamixsun/segformer_for_optic_disc_cup_segmentation"
-WEIGHTS_DIR = Path(__file__).parent / "weights"
+MODEL_ID     = "pamixsun/segformer_for_optic_disc_cup_segmentation"
+WEIGHTS_DIR  = Path(__file__).parent / "weights"
+WEIGHTS_FILE = WEIGHTS_DIR / "model.safetensors"
 
 # ---------------------------------------------------------------------------
 # Lazy model loader
@@ -48,13 +49,15 @@ def _get_model():
         os.environ["HF_HOME"] = str(WEIGHTS_DIR)
         os.environ["TRANSFORMERS_CACHE"] = str(WEIGHTS_DIR)
 
+        if not WEIGHTS_FILE.exists():
+            raise FileNotFoundError(f"Weights not found: {WEIGHTS_FILE}")
         logger.info(f"Loading {MODEL_ID} from {WEIGHTS_DIR} ...")
         device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         processor = AutoImageProcessor.from_pretrained(
             MODEL_ID, cache_dir=str(WEIGHTS_DIR), local_files_only=True,
         )
         model = SegformerForSemanticSegmentation.from_pretrained(
-            MODEL_ID, cache_dir=str(WEIGHTS_DIR), local_files_only=True,
+            str(WEIGHTS_DIR), local_files_only=True,
         ).to(device)
         model.eval()
 
@@ -131,7 +134,7 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
         "full_disc_pixel_count": disc_px,
         "cdr":                   cdr,
         "masks_b64":             base64.b64encode(buf.getvalue()).decode(),
-        "model":                 MODEL_ID,
+        "model":                 str(WEIGHTS_FILE.name),
         "created_at":            datetime.utcnow().isoformat() + "Z",
     })
 
@@ -139,5 +142,9 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
 @mcp.tool()
 async def health() -> str:
     """Liveness probe."""
-    return json.dumps({"status": "ok", "service": "fundus-cup-disc",
-                       "weights_dir": str(WEIGHTS_DIR)})
+    return json.dumps({
+        "status":         "ok",
+        "service":        "fundus-cup-disc",
+        "weights_file":   str(WEIGHTS_FILE),
+        "weights_exists": WEIGHTS_FILE.exists(),
+    })
