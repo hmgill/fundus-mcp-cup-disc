@@ -14,13 +14,10 @@ Tools:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import json
 import logging
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -29,7 +26,7 @@ logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config & model loader  (defined before lifespan references it)
+# Config & model loader
 # ---------------------------------------------------------------------------
 
 WEIGHTS_DIR  = Path(__file__).parent / "weights"
@@ -66,14 +63,13 @@ def _get_model():
 # FastMCP app
 # ---------------------------------------------------------------------------
 
-@asynccontextmanager
-async def lifespan(server) -> AsyncIterator[None]:
-    logger.info("Pre-loading SegFormer at startup...")
-    _get_model()   # blocking is fine here — no requests yet
-    logger.info("Model ready.")
-    yield
+# Load model at module level. Runs on every cold start in Lambda, but is
+# reused across warm invocations within the same container instance.
+logger.info("Loading model at module import...")
+_get_model()
+logger.info("Model ready.")
 
-mcp = FastMCP("fundus-cup-disc", lifespan=lifespan)
+mcp = FastMCP("fundus-cup-disc")
 
 
 # ---------------------------------------------------------------------------
