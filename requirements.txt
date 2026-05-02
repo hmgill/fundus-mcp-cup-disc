@@ -1,4 +1,4 @@
-fastmcp>=3.2.4
+fastmcp[tasks]>=3.2.4
 transformers>=4.35.0
 torch
 torchvision
