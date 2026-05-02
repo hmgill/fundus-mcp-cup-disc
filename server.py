@@ -69,7 +69,7 @@ logger.info("Loading model at module import...")
 _get_model()
 logger.info("Model ready.")
 
-mcp = FastMCP("fundus-cup-disc", stateless_http=True, json_response=True)
+mcp = FastMCP("fundus-cup-disc")
 
 
 # ---------------------------------------------------------------------------
@@ -154,3 +154,7 @@ async def health() -> str:
         "weights_file":   str(WEIGHTS_FILE),
         "weights_exists": WEIGHTS_FILE.exists(),
     })
+
+
+if __name__ == "__main__":
+    mcp.run(stateless_http=True, json_response=True)
