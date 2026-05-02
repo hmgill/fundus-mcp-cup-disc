@@ -69,7 +69,7 @@ logger.info("Loading model at module import...")
 _get_model()
 logger.info("Model ready.")
 
-mcp = FastMCP("fundus-cup-disc")
+mcp = FastMCP("fundus-cup-disc", stateless_http=True)
 
 
 # ---------------------------------------------------------------------------
