@@ -40,21 +40,19 @@ WEIGHTS_FILE = WEIGHTS_DIR / "cup-disc.safetensors"
 
 _model_cache: dict = {}
 
-
 def _get_model():
     if "model" not in _model_cache:
         import torch
         from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
-        os.environ["HF_HOME"] = str(WEIGHTS_DIR)
-        os.environ["TRANSFORMERS_CACHE"] = str(WEIGHTS_DIR)
-
         if not WEIGHTS_FILE.exists():
             raise FileNotFoundError(f"Weights not found: {WEIGHTS_FILE}")
-        logger.info(f"Loading {MODEL_ID} from {WEIGHTS_DIR} ...")
+        logger.info(f"Loading model from {WEIGHTS_DIR} ...")
         device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Pass the local directory directly for both — no network call made
         processor = AutoImageProcessor.from_pretrained(
-            MODEL_ID, cache_dir=str(WEIGHTS_DIR), local_files_only=True,
+            str(WEIGHTS_DIR), local_files_only=True,
         )
         model = SegformerForSemanticSegmentation.from_pretrained(
             str(WEIGHTS_DIR), local_files_only=True,
@@ -67,6 +65,7 @@ def _get_model():
         logger.info(f"SegFormer ready on {device}.")
 
     return _model_cache["model"], _model_cache["processor"], _model_cache["device"]
+
 
 
 # ---------------------------------------------------------------------------
