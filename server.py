@@ -5,6 +5,8 @@ import base64
 import io
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -13,7 +15,7 @@ logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config & model loader  (must be above the startup hook)
+# Config & model loader  (defined before lifespan references it)
 # ---------------------------------------------------------------------------
 
 WEIGHTS_DIR  = Path(__file__).parent / "weights"
@@ -47,11 +49,12 @@ def _get_model():
 # FastMCP app
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("fundus-cup-disc")
-
-@mcp.on_startup()
-async def load_model_on_startup():
+@asynccontextmanager
+async def lifespan(server) -> AsyncIterator[None]:
     logger.info("Pre-loading SegFormer at startup...")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _get_model)
     logger.info("Model ready.")
+    yield
+
+mcp = FastMCP("fundus-cup-disc", lifespan=lifespan)
