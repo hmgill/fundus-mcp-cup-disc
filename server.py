@@ -124,10 +124,6 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     disc_px = int(full_disc.sum())
     cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
 
-    buf = io.BytesIO()
-    np.savez_compressed(buf, disc_annulus=disc_annulus, cup=cup,
-                        full_disc=full_disc, cd_raw=cd_raw)
-
     return json.dumps({
         "success":               True,
         "image_id":              image_id,
@@ -136,7 +132,7 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
         "cup_pixel_count":       cup_px,
         "full_disc_pixel_count": disc_px,
         "cdr":                   cdr,
-        "masks_b64":             base64.b64encode(buf.getvalue()).decode(),
+        "masks_b64":             "DUMMY",   # TODO: re-enable once payload size confirmed OK
         "model":                 str(WEIGHTS_FILE.name),
         "created_at":            datetime.utcnow().isoformat() + "Z",
     })
