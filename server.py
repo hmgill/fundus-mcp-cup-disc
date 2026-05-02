@@ -69,11 +69,9 @@ def _get_model():
 @asynccontextmanager
 async def lifespan(server) -> AsyncIterator[None]:
     logger.info("Pre-loading SegFormer at startup...")
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _get_model)
+    _get_model()   # blocking is fine here — no requests yet
     logger.info("Model ready.")
     yield
-
 
 mcp = FastMCP("fundus-cup-disc", lifespan=lifespan)
 
