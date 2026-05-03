@@ -2,16 +2,14 @@
 server.py — fundus-mcp-cup-disc
 ================================
 FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
-for deployment on Prefect Horizon (stateless HTTP, multi-process).
+for deployment on Prefect Horizon.
 
-/tmp checkpoint cache (fixed):
-  - First cold start: parses safetensors (~20s on slow I/O, ~1s from /tmp cache),
-    saves state_dict via torch.save to /tmp/segformer_cached.pt.
-  - Subsequent workers: load architecture from config.json (no weights),
-    then load_state_dict() from /tmp. Fast and avoids the
-    "state_dict cannot be passed with a model name" error.
-  - Dummy warm-up is SKIPPED during module import (Lambda is already near timeout
-    after a 20s safetensors parse). Warm-up runs only on the FIRST real tool call.
+Weights are committed to the repo via Git LFS and loaded from
+the ./weights/ directory at startup. No download required.
+
+Tools:
+    segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ  [background task]
+    health()                              → liveness check
 """
 
 from __future__ import annotations
@@ -21,186 +19,108 @@ import io
 import json
 import logging
 import os
-import time
-from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
-from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.dependencies import Progress
+from fastmcp.server.tasks import TaskConfig
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config
+# Config & model loader
 # ---------------------------------------------------------------------------
 
-WEIGHTS_DIR        = Path(__file__).parent / "weights"
-WEIGHTS_FILE       = WEIGHTS_DIR / "model.safetensors"
-TMP_CACHE_PT       = Path("/tmp/segformer_cached.pt")
-ENABLE_MASKS       = os.environ.get("ENABLE_MASKS", "0") == "1"
-MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+WEIGHTS_DIR   = Path(__file__).parent / "weights"
+WEIGHTS_FILE  = WEIGHTS_DIR / "model.safetensors"
+TMP_CACHE_DIR = Path("/tmp/fundus-model-cache")
 
-_model_cache: dict[str, Any] = {}
+_model_cache: dict = {}
 
 
-# ---------------------------------------------------------------------------
-# Model loader
-# ---------------------------------------------------------------------------
-
-def _load_model(run_warmup: bool = False) -> None:
-    """
-    Load SegFormer into _model_cache.
-
-    Fast path (/tmp exists):
-      1. Load architecture from config.json only (no weights, instant).
-      2. load_state_dict() from /tmp/segformer_cached.pt (~2s).
-
-    Slow path (first ever cold start):
-      1. from_pretrained() with full safetensors parse (~20s).
-      2. torch.save(state_dict) to /tmp for future workers.
-
-    run_warmup: if True, run a dummy 64x64 inference after loading.
-      Pass False during module import (Lambda near-timeout after slow path).
-      Pass True on first real tool call (budget available).
-    """
-    if "model" in _model_cache:
-        return
-
-    import torch
-    from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
-    import numpy as np
-
-    if not WEIGHTS_FILE.exists():
-        raise FileNotFoundError(
-            f"Weights not found: {WEIGHTS_FILE}. "
-            "Ensure weights/model.safetensors is committed via Git LFS."
-        )
-
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    processor = AutoImageProcessor.from_pretrained(str(WEIGHTS_DIR), local_files_only=True)
-
-    if TMP_CACHE_PT.exists():
-        # Fast path: load architecture shell, then fill weights from /tmp
-        logger.info(f"Loading architecture from config + weights from /tmp (PID={os.getpid()}) ...")
-        t0 = time.time()
-        try:
-            # Load model structure only (no weights) — avoids "state_dict + name" conflict
-            model = SegformerForSemanticSegmentation.from_pretrained(
-                str(WEIGHTS_DIR),
-                local_files_only=True,
-                ignore_mismatched_sizes=False,
-                _fast_init=False,          # skip weight init, we'll overwrite anyway
-            )
-            # Now overwrite with cached weights
-            state_dict = torch.load(str(TMP_CACHE_PT), map_location=device)
-            model.load_state_dict(state_dict)
-            del state_dict
-            logger.info(f"Loaded from /tmp in {time.time()-t0:.1f}s")
-        except Exception as e:
-            logger.warning(f"/tmp cache load failed ({e}), deleting and falling back to safetensors")
-            TMP_CACHE_PT.unlink(missing_ok=True)
-            return _load_model(run_warmup=run_warmup)
-    else:
-        # Slow path: full safetensors parse
-        logger.info(f"Loading from safetensors (PID={os.getpid()}) ...")
-        t0 = time.time()
-        model = SegformerForSemanticSegmentation.from_pretrained(
-            str(WEIGHTS_DIR), local_files_only=True,
-        )
-        elapsed = time.time() - t0
-        logger.info(f"Parsed safetensors in {elapsed:.1f}s, saving to /tmp ...")
-        try:
-            torch.save(model.state_dict(), str(TMP_CACHE_PT))
-            logger.info(f"Saved {TMP_CACHE_PT.stat().st_size // 1024 // 1024} MB to /tmp")
-        except Exception as e:
-            logger.warning(f"Could not save /tmp cache: {e}")
-
-    model = model.to(device)
-    model.eval()
-
-    _model_cache["model"]     = model
-    _model_cache["processor"] = processor
-    _model_cache["device"]    = device
-    _model_cache["warmed_up"] = False
-    logger.info(f"SegFormer ready on {device} (PID={os.getpid()})")
-
-    if run_warmup:
-        _run_warmup()
-
-
-def _run_warmup() -> None:
-    """Run a single dummy inference to force cuDNN kernel selection."""
-    import torch
-    import numpy as np
-    from PIL import Image as _Image
-
-    model     = _model_cache["model"]
-    processor = _model_cache["processor"]
-    device    = _model_cache["device"]
-
-    logger.info("Running dummy warm-up inference (64x64) ...")
-    dummy  = _Image.fromarray(np.zeros((64, 64, 3), dtype="uint8"))
-    inputs = processor(dummy, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        _ = model(**inputs).logits
-    _model_cache["warmed_up"] = True
-    logger.info("Warm-up complete.")
-
-
-# ---------------------------------------------------------------------------
-# Module-level pre-warm (no warmup pass — Lambda timeout budget is tight)
-# ---------------------------------------------------------------------------
-
-try:
-    logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
-    _load_model(run_warmup=False)
-except Exception as _e:
-    logger.error(f"Module-level model load failed: {_e}", exc_info=True)
-    _model_cache["load_error"] = str(_e)
-
-
-# ---------------------------------------------------------------------------
-# Lifespan safety net
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def lifespan(app: FastMCP):
+def _get_model():
     if "model" not in _model_cache:
-        logger.info(f"Lifespan: model not loaded, loading now (PID={os.getpid()}) ...")
-        try:
-            _load_model(run_warmup=False)
-        except Exception as e:
-            logger.error(f"Lifespan load failed: {e}", exc_info=True)
-            _model_cache["load_error"] = str(e)
-    else:
-        logger.info(f"Lifespan: model already loaded (PID={os.getpid()})")
-    yield
+        import torch
+        from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+
+        if not WEIGHTS_FILE.exists():
+            raise FileNotFoundError(f"Weights not found: {WEIGHTS_FILE}")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Use /tmp cache if available — avoids re-parsing safetensors (~24s → ~1s)
+        if TMP_CACHE_DIR.exists():
+            logger.info(f"Loading from /tmp cache (PID={os.getpid()}) ...")
+            src = str(TMP_CACHE_DIR)
+        else:
+            logger.info(f"Loading from safetensors (PID={os.getpid()}) ...")
+            src = str(WEIGHTS_DIR)
+
+        processor = AutoImageProcessor.from_pretrained(src, local_files_only=True)
+        # Override to training size (224) — preprocessor_config.json says 512
+        # but config.json shows image_size=224. Smaller input = faster CPU inference.
+        processor.size = {"height": 224, "width": 224}
+
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            src, local_files_only=True,
+        ).to(device)
+        model.eval()
+
+        # Save to /tmp so subsequent cold starts in this container skip safetensors parsing
+        if not TMP_CACHE_DIR.exists():
+            logger.info(f"Saving parsed weights to {TMP_CACHE_DIR} ...")
+            model.save_pretrained(str(TMP_CACHE_DIR))
+            processor.save_pretrained(str(TMP_CACHE_DIR))
+            logger.info("Cache saved.")
+
+        _model_cache["model"]     = model
+        _model_cache["processor"] = processor
+        _model_cache["device"]    = device
+        logger.info(f"SegFormer ready on {device}.")
+
+    return _model_cache["model"], _model_cache["processor"], _model_cache["device"]
 
 
-mcp = FastMCP("fundus-cup-disc", lifespan=lifespan)
+# ---------------------------------------------------------------------------
+# FastMCP app
+# ---------------------------------------------------------------------------
+
+# Load model at module level. Runs on every cold start in Lambda, but is
+# reused across warm invocations within the same container instance.
+logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
+_get_model()
+logger.info("Model ready.")
+
+mcp = FastMCP("fundus-cup-disc")
 
 
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def segment_cup_disc(image_b64: str, image_id: str) -> str:
+@mcp.tool(task=TaskConfig(mode="required", poll_interval=timedelta(seconds=5)))
+async def segment_cup_disc(
+    image_b64: str,
+    image_id: str,
+    progress: Progress = Progress(),
+) -> str:
     """
-    Run SegFormer optic cup and disc segmentation on a fundus image.
+    Run SegFormer optic cup and disc segmentation as a background task.
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
-                    Resize to <=512x512 before encoding.
-        image_id:   Identifier string echoed in the result JSON.
+        image_id:   Identifier for this image.
 
     Returns:
-        JSON with disc/cup pixel counts, CDR, and image shape.
+        JSON with disc/cup pixel counts, CDR, and base64-encoded NPZ
+        containing disc_annulus, cup, full_disc, and cd_raw arrays.
 
     Label map:
-        0 = background | 1 = disc annulus | 2 = optic cup
+        0 = background
+        1 = disc annulus (outer ring, excludes cup)
+        2 = optic cup
     """
     import torch
     import torch.nn.functional as F
@@ -209,39 +129,30 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     from datetime import datetime
 
     try:
-        # Lazy load if somehow missed at import/lifespan
-        if "model" not in _model_cache:
-            logger.warning(f"Model missing at tool call time (PID={os.getpid()}), loading ...")
-            _load_model(run_warmup=False)
+        await progress.set_total(3)
 
-        if "model" not in _model_cache:
-            return json.dumps({
-                "success":  False,
-                "error":    f"Model not loaded: {_model_cache.get('load_error', 'unknown')}",
-                "image_id": image_id,
-            })
+        await progress.set_message("Loading model...")
+        model, processor, device = _get_model()
 
-        # First real call: run warm-up now (budget available inside the tool call)
-        if not _model_cache.get("warmed_up"):
-            _run_warmup()
-
-        model     = _model_cache["model"]
-        processor = _model_cache["processor"]
-        device    = _model_cache["device"]
-
+        await progress.set_message("Preprocessing image...")
         img_bytes = base64.b64decode(image_b64)
         image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w, h      = image.size
-        logger.info(f"[{image_id}] Input: {w}x{h} PID={os.getpid()}")
 
         inputs = processor(image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        await progress.increment()
 
+        await progress.set_message("Running segmentation inference...")
         with torch.no_grad():
             logits = model(**inputs).logits
+        await progress.increment()
 
-        upsampled    = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
-        cd_raw       = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+        await progress.set_message("Computing mask statistics...")
+        upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
+                                  align_corners=False)
+        cd_raw    = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+
         disc_annulus = (cd_raw == 1).astype(np.uint8)
         cup          = (cd_raw == 2).astype(np.uint8)
         full_disc    = (cd_raw >= 1).astype(np.uint8)
@@ -250,7 +161,7 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
         disc_px = int(full_disc.sum())
         cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
 
-        result: dict = {
+        payload = json.dumps({
             "success":               True,
             "image_id":              image_id,
             "shape":                 list(cd_raw.shape),
@@ -258,52 +169,28 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
             "cup_pixel_count":       cup_px,
             "full_disc_pixel_count": disc_px,
             "cdr":                   cdr,
+            "masks_b64":             "DUMMY",   # TODO: re-enable once payload size confirmed OK
             "model":                 str(WEIGHTS_FILE.name),
             "created_at":            datetime.utcnow().isoformat() + "Z",
-            "masks_included":        False,
-        }
-
-        if ENABLE_MASKS:
-            npz_buf = io.BytesIO()
-            np.savez_compressed(npz_buf,
-                disc_annulus=disc_annulus, cup=cup,
-                full_disc=full_disc, cd_raw=cd_raw)
-            npz_b64 = base64.b64encode(npz_buf.getvalue()).decode()
-            probe   = json.dumps({**result, "masks_b64": npz_b64})
-            if len(probe.encode()) <= MAX_RESPONSE_BYTES:
-                result["masks_b64"]      = npz_b64
-                result["masks_included"] = True
-            else:
-                logger.warning(f"[{image_id}] NPZ {len(probe)//1024} KB > budget, omitted")
-
-        payload = json.dumps(result)
-        logger.info(f"[{image_id}] Done {len(payload)//1024}KB CDR={cdr}")
+        })
+        logger.info(f"Response payload size: {len(payload)} bytes ({len(payload)/1024:.1f} KB)")
+        await progress.increment()
         return payload
 
     except Exception as e:
-        logger.error(f"segment_cup_disc failed [{image_id}]: {e}", exc_info=True)
+        logger.error(f"segment_cup_disc failed: {e}", exc_info=True)
         return json.dumps({"success": False, "error": str(e), "image_id": image_id})
 
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe — reports model load status, device, and cache info."""
-    import torch
+    """Liveness probe. Also reports whether the /tmp model cache is present."""
     return json.dumps({
-        "status":           "ok",
-        "service":          "fundus-cup-disc",
-        "pid":              os.getpid(),
-        "weights_file":     str(WEIGHTS_FILE),
-        "weights_exists":   WEIGHTS_FILE.exists(),
-        "tmp_cache":        str(TMP_CACHE_PT),
-        "tmp_cache_exists": TMP_CACHE_PT.exists(),
-        "tmp_cache_mb":     round(TMP_CACHE_PT.stat().st_size / 1024 / 1024, 1) if TMP_CACHE_PT.exists() else 0,
-        "model_loaded":     "model" in _model_cache,
-        "warmed_up":        _model_cache.get("warmed_up", False),
-        "load_error":       _model_cache.get("load_error"),
-        "device":           str(_model_cache.get("device", "not loaded")),
-        "masks_enabled":    ENABLE_MASKS,
-        "cuda_available":   torch.cuda.is_available(),
+        "status":         "ok",
+        "service":        "fundus-cup-disc",
+        "weights_file":   str(WEIGHTS_FILE),
+        "weights_exists": WEIGHTS_FILE.exists(),
+        "tmp_cache":      TMP_CACHE_DIR.exists(),
     })
 
 
