@@ -4,14 +4,14 @@ server.py — fundus-mcp-cup-disc
 FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
 for deployment on Prefect Horizon (stateless HTTP, multi-process).
 
-This version runs segment_cup_disc as a regular synchronous tool (no tasks/
-background workers). The call blocks until inference completes and returns
-the result directly. Simpler, fewer moving parts, no GetTaskRequest polling.
-
-/tmp checkpoint cache:
-  First worker parses safetensors (~20s) and saves to /tmp/segformer_cached.pt.
-  Subsequent workers load from /tmp (~2-3s). Persists across worker spawns
-  within the same Horizon deployment instance.
+/tmp checkpoint cache (fixed):
+  - First cold start: parses safetensors (~20s on slow I/O, ~1s from /tmp cache),
+    saves state_dict via torch.save to /tmp/segformer_cached.pt.
+  - Subsequent workers: load architecture from config.json (no weights),
+    then load_state_dict() from /tmp. Fast and avoids the
+    "state_dict cannot be passed with a model name" error.
+  - Dummy warm-up is SKIPPED during module import (Lambda is already near timeout
+    after a 20s safetensors parse). Warm-up runs only on the FIRST real tool call.
 """
 
 from __future__ import annotations
@@ -48,7 +48,22 @@ _model_cache: dict[str, Any] = {}
 # Model loader
 # ---------------------------------------------------------------------------
 
-def _load_model() -> None:
+def _load_model(run_warmup: bool = False) -> None:
+    """
+    Load SegFormer into _model_cache.
+
+    Fast path (/tmp exists):
+      1. Load architecture from config.json only (no weights, instant).
+      2. load_state_dict() from /tmp/segformer_cached.pt (~2s).
+
+    Slow path (first ever cold start):
+      1. from_pretrained() with full safetensors parse (~20s).
+      2. torch.save(state_dict) to /tmp for future workers.
+
+    run_warmup: if True, run a dummy 64x64 inference after loading.
+      Pass False during module import (Lambda near-timeout after slow path).
+      Pass True on first real tool call (budget available).
+    """
     if "model" in _model_cache:
         return
 
@@ -66,25 +81,35 @@ def _load_model() -> None:
     processor = AutoImageProcessor.from_pretrained(str(WEIGHTS_DIR), local_files_only=True)
 
     if TMP_CACHE_PT.exists():
-        logger.info(f"Loading from /tmp cache (PID={os.getpid()}) ...")
+        # Fast path: load architecture shell, then fill weights from /tmp
+        logger.info(f"Loading architecture from config + weights from /tmp (PID={os.getpid()}) ...")
         t0 = time.time()
         try:
+            # Load model structure only (no weights) — avoids "state_dict + name" conflict
             model = SegformerForSemanticSegmentation.from_pretrained(
-                str(WEIGHTS_DIR), local_files_only=True,
-                state_dict=torch.load(str(TMP_CACHE_PT), map_location=device),
+                str(WEIGHTS_DIR),
+                local_files_only=True,
+                ignore_mismatched_sizes=False,
+                _fast_init=False,          # skip weight init, we'll overwrite anyway
             )
+            # Now overwrite with cached weights
+            state_dict = torch.load(str(TMP_CACHE_PT), map_location=device)
+            model.load_state_dict(state_dict)
+            del state_dict
             logger.info(f"Loaded from /tmp in {time.time()-t0:.1f}s")
         except Exception as e:
-            logger.warning(f"/tmp cache load failed ({e}), falling back to safetensors")
+            logger.warning(f"/tmp cache load failed ({e}), deleting and falling back to safetensors")
             TMP_CACHE_PT.unlink(missing_ok=True)
-            return _load_model()
+            return _load_model(run_warmup=run_warmup)
     else:
+        # Slow path: full safetensors parse
         logger.info(f"Loading from safetensors (PID={os.getpid()}) ...")
         t0 = time.time()
         model = SegformerForSemanticSegmentation.from_pretrained(
             str(WEIGHTS_DIR), local_files_only=True,
         )
-        logger.info(f"Parsed safetensors in {time.time()-t0:.1f}s, saving to /tmp ...")
+        elapsed = time.time() - t0
+        logger.info(f"Parsed safetensors in {elapsed:.1f}s, saving to /tmp ...")
         try:
             torch.save(model.state_dict(), str(TMP_CACHE_PT))
             logger.info(f"Saved {TMP_CACHE_PT.stat().st_size // 1024 // 1024} MB to /tmp")
@@ -94,27 +119,43 @@ def _load_model() -> None:
     model = model.to(device)
     model.eval()
 
-    logger.info("Dummy warm-up inference ...")
+    _model_cache["model"]     = model
+    _model_cache["processor"] = processor
+    _model_cache["device"]    = device
+    _model_cache["warmed_up"] = False
+    logger.info(f"SegFormer ready on {device} (PID={os.getpid()})")
+
+    if run_warmup:
+        _run_warmup()
+
+
+def _run_warmup() -> None:
+    """Run a single dummy inference to force cuDNN kernel selection."""
+    import torch
+    import numpy as np
     from PIL import Image as _Image
-    dummy  = _Image.fromarray(__import__("numpy").zeros((64, 64, 3), dtype="uint8"))
+
+    model     = _model_cache["model"]
+    processor = _model_cache["processor"]
+    device    = _model_cache["device"]
+
+    logger.info("Running dummy warm-up inference (64x64) ...")
+    dummy  = _Image.fromarray(np.zeros((64, 64, 3), dtype="uint8"))
     inputs = processor(dummy, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         _ = model(**inputs).logits
-
-    _model_cache["model"]     = model
-    _model_cache["processor"] = processor
-    _model_cache["device"]    = device
-    logger.info(f"SegFormer ready on {device} (PID={os.getpid()})")
+    _model_cache["warmed_up"] = True
+    logger.info("Warm-up complete.")
 
 
 # ---------------------------------------------------------------------------
-# Module-level pre-warm
+# Module-level pre-warm (no warmup pass — Lambda timeout budget is tight)
 # ---------------------------------------------------------------------------
 
 try:
     logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
-    _load_model()
+    _load_model(run_warmup=False)
 except Exception as _e:
     logger.error(f"Module-level model load failed: {_e}", exc_info=True)
     _model_cache["load_error"] = str(_e)
@@ -127,9 +168,9 @@ except Exception as _e:
 @asynccontextmanager
 async def lifespan(app: FastMCP):
     if "model" not in _model_cache:
-        logger.info(f"Lifespan: loading model (PID={os.getpid()}) ...")
+        logger.info(f"Lifespan: model not loaded, loading now (PID={os.getpid()}) ...")
         try:
-            _load_model()
+            _load_model(run_warmup=False)
         except Exception as e:
             logger.error(f"Lifespan load failed: {e}", exc_info=True)
             _model_cache["load_error"] = str(e)
@@ -168,9 +209,10 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     from datetime import datetime
 
     try:
+        # Lazy load if somehow missed at import/lifespan
         if "model" not in _model_cache:
-            logger.warning(f"Model missing at call time (PID={os.getpid()}), loading ...")
-            _load_model()
+            logger.warning(f"Model missing at tool call time (PID={os.getpid()}), loading ...")
+            _load_model(run_warmup=False)
 
         if "model" not in _model_cache:
             return json.dumps({
@@ -178,6 +220,10 @@ async def segment_cup_disc(image_b64: str, image_id: str) -> str:
                 "error":    f"Model not loaded: {_model_cache.get('load_error', 'unknown')}",
                 "image_id": image_id,
             })
+
+        # First real call: run warm-up now (budget available inside the tool call)
+        if not _model_cache.get("warmed_up"):
+            _run_warmup()
 
         model     = _model_cache["model"]
         processor = _model_cache["processor"]
@@ -253,6 +299,7 @@ async def health() -> str:
         "tmp_cache_exists": TMP_CACHE_PT.exists(),
         "tmp_cache_mb":     round(TMP_CACHE_PT.stat().st_size / 1024 / 1024, 1) if TMP_CACHE_PT.exists() else 0,
         "model_loaded":     "model" in _model_cache,
+        "warmed_up":        _model_cache.get("warmed_up", False),
         "load_error":       _model_cache.get("load_error"),
         "device":           str(_model_cache.get("device", "not loaded")),
         "masks_enabled":    ENABLE_MASKS,
