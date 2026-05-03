@@ -93,6 +93,16 @@ logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
 _get_model()
 logger.info("Model ready.")
 
+# Redis is required for background tasks to work across stateless HTTP requests.
+# Each request may hit a different process; in-memory task state won't survive.
+# Set FASTMCP_DOCKET_URL=redis://... in your Horizon environment variables.
+_redis_url = os.environ.get("FASTMCP_DOCKET_URL")
+if not _redis_url:
+    logger.warning(
+        "FASTMCP_DOCKET_URL is not set — background tasks will fail across "
+        "stateless HTTP requests. Set this to your Redis URL in Horizon env vars."
+    )
+
 mcp = FastMCP("fundus-cup-disc")
 
 
@@ -161,6 +171,17 @@ async def segment_cup_disc(
         disc_px = int(full_disc.sum())
         cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
 
+        # Encode masks as base64 NPZ
+        npz_buf = io.BytesIO()
+        np.savez_compressed(
+            npz_buf,
+            disc_annulus=disc_annulus,
+            cup=cup,
+            full_disc=full_disc,
+            cd_raw=cd_raw,
+        )
+        masks_b64 = base64.b64encode(npz_buf.getvalue()).decode()
+
         payload = json.dumps({
             "success":               True,
             "image_id":              image_id,
@@ -169,7 +190,7 @@ async def segment_cup_disc(
             "cup_pixel_count":       cup_px,
             "full_disc_pixel_count": disc_px,
             "cdr":                   cdr,
-            "masks_b64":             "DUMMY",   # TODO: re-enable once payload size confirmed OK
+            "masks_b64":             masks_b64,
             "model":                 str(WEIGHTS_FILE.name),
             "created_at":            datetime.utcnow().isoformat() + "Z",
         })
