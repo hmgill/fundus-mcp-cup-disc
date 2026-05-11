@@ -1,15 +1,18 @@
 """
 server.py — fundus-mcp-cup-disc
 ================================
-FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
-for deployment on Prefect Horizon.
+FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool.
+
+The tool returns a synchronous JSON-RPC response — no background task polling.
+This is required for compatibility with the Agents SDK's MCPServerStreamableHttp,
+which expects standard JSON-RPC responses.
 
 Weights are committed to the repo via Git LFS and loaded from
 the ./weights/ directory at startup. No download required.
 
 Tools:
-    segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ  [background task]
-    health()                              → liveness check
+    segment_cup_disc(image_b64, image_id) -> mask stats + base64 NPZ
+    health()                              -> liveness check
 """
 
 from __future__ import annotations
@@ -19,12 +22,9 @@ import io
 import json
 import logging
 import os
-from datetime import timedelta
 from pathlib import Path
 
 from fastmcp import FastMCP
-from fastmcp.dependencies import Progress
-from fastmcp.server.tasks import TaskConfig
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,7 +50,6 @@ def _get_model():
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Use /tmp cache if available — avoids re-parsing safetensors (~24s → ~1s)
         if TMP_CACHE_DIR.exists():
             logger.info(f"Loading from /tmp cache (PID={os.getpid()}) ...")
             src = str(TMP_CACHE_DIR)
@@ -59,8 +58,6 @@ def _get_model():
             src = str(WEIGHTS_DIR)
 
         processor = AutoImageProcessor.from_pretrained(src, local_files_only=True)
-        # Override to training size (224) — preprocessor_config.json says 512
-        # but config.json shows image_size=224. Smaller input = faster CPU inference.
         processor.size = {"height": 224, "width": 224}
 
         model = SegformerForSemanticSegmentation.from_pretrained(
@@ -68,7 +65,6 @@ def _get_model():
         ).to(device)
         model.eval()
 
-        # Save to /tmp so subsequent cold starts in this container skip safetensors parsing
         if not TMP_CACHE_DIR.exists():
             logger.info(f"Saving parsed weights to {TMP_CACHE_DIR} ...")
             model.save_pretrained(str(TMP_CACHE_DIR))
@@ -87,21 +83,9 @@ def _get_model():
 # FastMCP app
 # ---------------------------------------------------------------------------
 
-# Load model at module level. Runs on every cold start in Lambda, but is
-# reused across warm invocations within the same container instance.
 logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
 _get_model()
 logger.info("Model ready.")
-
-# Redis is required for background tasks to work across stateless HTTP requests.
-# Each request may hit a different process; in-memory task state won't survive.
-# Set FASTMCP_DOCKET_URL=redis://... in your Horizon environment variables.
-_redis_url = os.environ.get("FASTMCP_DOCKET_URL")
-if not _redis_url:
-    logger.warning(
-        "FASTMCP_DOCKET_URL is not set — background tasks will fail across "
-        "stateless HTTP requests. Set this to your Redis URL in Horizon env vars."
-    )
 
 mcp = FastMCP("fundus-cup-disc")
 
@@ -110,14 +94,10 @@ mcp = FastMCP("fundus-cup-disc")
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(task=TaskConfig(mode="required", poll_interval=timedelta(seconds=5)))
-async def segment_cup_disc(
-    image_b64: str,
-    image_id: str,
-    progress: Progress = Progress(),
-) -> str:
+@mcp.tool()
+async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     """
-    Run SegFormer optic cup and disc segmentation as a background task.
+    Run SegFormer optic cup and disc segmentation.
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
@@ -139,26 +119,18 @@ async def segment_cup_disc(
     from datetime import datetime
 
     try:
-        await progress.set_total(3)
-
-        await progress.set_message("Loading model...")
         model, processor, device = _get_model()
 
-        await progress.set_message("Preprocessing image...")
         img_bytes = base64.b64decode(image_b64)
         image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w, h      = image.size
 
         inputs = processor(image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        await progress.increment()
 
-        await progress.set_message("Running segmentation inference...")
         with torch.no_grad():
             logits = model(**inputs).logits
-        await progress.increment()
 
-        await progress.set_message("Computing mask statistics...")
         upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
                                   align_corners=False)
         cd_raw    = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
@@ -171,7 +143,6 @@ async def segment_cup_disc(
         disc_px = int(full_disc.sum())
         cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
 
-        # Encode masks as base64 NPZ
         npz_buf = io.BytesIO()
         np.savez_compressed(
             npz_buf,
@@ -194,8 +165,7 @@ async def segment_cup_disc(
             "model":                 str(WEIGHTS_FILE.name),
             "created_at":            datetime.utcnow().isoformat() + "Z",
         })
-        logger.info(f"Response payload size: {len(payload)} bytes ({len(payload)/1024:.1f} KB)")
-        await progress.increment()
+        logger.info(f"segment_cup_disc: {image_id}  CDR={cdr}  payload={len(payload)/1024:.1f}KB")
         return payload
 
     except Exception as e:
@@ -205,7 +175,7 @@ async def segment_cup_disc(
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe. Also reports whether the /tmp model cache is present."""
+    """Liveness probe. Reports whether model weights and /tmp cache are present."""
     return json.dumps({
         "status":         "ok",
         "service":        "fundus-cup-disc",
