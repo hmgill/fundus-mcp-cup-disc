@@ -2,11 +2,21 @@
 server.py — fundus-mcp-cup-disc
 ================================
 FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
-deployed on a platform that wraps all responses in task envelopes.
-task=True is required on the client side (fastmcp.Client) to handle this.
+deployed via Prefect Horizon.
 
-Weights are committed to the repo via Git LFS and loaded from
-the ./weights/ directory at startup. No download required.
+Preprocessing (base64 decode + PIL validation) runs locally; GPU inference is
+dispatched to a RunPod serverless endpoint so Horizon doesn't need a GPU or
+model weights.
+
+Required environment variables:
+    RUNPOD_API_KEY       RunPod API key
+    RUNPOD_ENDPOINT_URL  Full RunPod endpoint base URL,
+                         e.g. https://api.runpod.ai/v2/<endpoint_id>
+
+Optional environment variables:
+    FASTMCP_DOCKET_URL   rediss://<host>:<port>  Redis for background tasks
+    RUNPOD_POLL_INTERVAL Seconds between status polls (default: 3)
+    RUNPOD_MAX_WAIT      Seconds before timeout (default: 120)
 
 Tools:
     segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ  [background task]
@@ -20,9 +30,10 @@ import io
 import json
 import logging
 import os
+import time
 from datetime import timedelta
-from pathlib import Path
 
+import requests
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
 from fastmcp.server.tasks import TaskConfig
@@ -30,76 +41,120 @@ from fastmcp.server.tasks import TaskConfig
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Config & model loader
+# Config
 # ---------------------------------------------------------------------------
 
-WEIGHTS_DIR   = Path(__file__).parent / "weights"
-WEIGHTS_FILE  = WEIGHTS_DIR / "model.safetensors"
-TMP_CACHE_DIR = Path("/tmp/fundus-model-cache")
+RUNPOD_API_KEY       = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_ENDPOINT_URL  = os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/")
+RUNPOD_POLL_INTERVAL = int(os.environ.get("RUNPOD_POLL_INTERVAL", "3"))
+RUNPOD_MAX_WAIT      = int(os.environ.get("RUNPOD_MAX_WAIT", "120"))
 
-_model_cache: dict = {}
+if not RUNPOD_API_KEY:
+    logger.warning("RUNPOD_API_KEY is not set — inference calls will fail.")
+if not RUNPOD_ENDPOINT_URL:
+    logger.warning("RUNPOD_ENDPOINT_URL is not set — inference calls will fail.")
+
+_redis_url = os.environ.get("FASTMCP_DOCKET_URL")
+if not _redis_url:
+    logger.warning(
+        "FASTMCP_DOCKET_URL is not set — background tasks will fail across "
+        "stateless HTTP requests. Set this to your Redis URL in Horizon env vars."
+    )
 
 
-def _get_model():
-    if "model" not in _model_cache:
-        import torch
-        from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+# ---------------------------------------------------------------------------
+# RunPod client
+# ---------------------------------------------------------------------------
 
-        if not WEIGHTS_FILE.exists():
-            raise FileNotFoundError(f"Weights not found: {WEIGHTS_FILE}")
+def _runpod_session() -> requests.Session:
+    """Return a requests Session pre-configured with RunPod auth headers."""
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {RUNPOD_API_KEY}",
+        "Content-Type":  "application/json",
+    })
+    return session
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Use /tmp cache if available — avoids re-parsing safetensors (~24s → ~1s)
-        if TMP_CACHE_DIR.exists():
-            logger.info(f"Loading from /tmp cache (PID={os.getpid()}) ...")
-            src = str(TMP_CACHE_DIR)
-        else:
-            logger.info(f"Loading from safetensors (PID={os.getpid()}) ...")
-            src = str(WEIGHTS_DIR)
+def _runpod_dispatch(image_id: str, image_b64: str) -> dict:
+    """
+    Submit a cup/disc segmentation job to the RunPod serverless endpoint and
+    poll until complete.
 
-        processor = AutoImageProcessor.from_pretrained(src, local_files_only=True)
-        # Override to training size (224) — preprocessor_config.json says 512
-        # but config.json shows image_size=224. Smaller input = faster CPU inference.
-        processor.size = {"height": 224, "width": 224}
+    Args:
+        image_id:   Identifier for logging and response correlation.
+        image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
 
-        model = SegformerForSemanticSegmentation.from_pretrained(
-            src, local_files_only=True,
-        ).to(device)
-        model.eval()
+    Returns:
+        The output dict from RunPod on success.
+        Raises RuntimeError on job failure or TimeoutError on timeout.
+    """
+    session = _runpod_session()
 
-        # Save to /tmp so subsequent cold starts in this container skip safetensors parsing
-        if not TMP_CACHE_DIR.exists():
-            logger.info(f"Saving parsed weights to {TMP_CACHE_DIR} ...")
-            model.save_pretrained(str(TMP_CACHE_DIR))
-            processor.save_pretrained(str(TMP_CACHE_DIR))
-            logger.info("Cache saved.")
+    resp = session.post(
+        f"{RUNPOD_ENDPOINT_URL}/run",
+        json={"input": {
+            "image_id":  image_id,
+            "image_b64": image_b64,
+        }},
+    )
+    resp.raise_for_status()
+    job_id = resp.json().get("id")
+    if not job_id:
+        raise RuntimeError(f"No job ID in RunPod response: {resp.json()}")
+    logger.info(f"[{image_id}] RunPod job submitted: {job_id}")
 
-        _model_cache["model"]     = model
-        _model_cache["processor"] = processor
-        _model_cache["device"]    = device
-        logger.info(f"SegFormer ready on {device}.")
+    deadline = time.time() + RUNPOD_MAX_WAIT
+    while time.time() < deadline:
+        resp = session.get(f"{RUNPOD_ENDPOINT_URL}/status/{job_id}")
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+        logger.info(f"[{image_id}] RunPod status: {status}")
+        if status == "COMPLETED":
+            output = data.get("output", {})
+            if not output.get("success"):
+                raise RuntimeError(
+                    f"RunPod job completed but reported failure: {output.get('error')}"
+                )
+            return output
+        if status == "FAILED":
+            raise RuntimeError(f"RunPod job failed: {data.get('error')}")
+        time.sleep(RUNPOD_POLL_INTERVAL)
 
-    return _model_cache["model"], _model_cache["processor"], _model_cache["device"]
+    raise TimeoutError(
+        f"RunPod job {job_id} did not complete within {RUNPOD_MAX_WAIT}s"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing — runs locally on Horizon, no GPU needed
+# ---------------------------------------------------------------------------
+
+def _validate_image(image_b64: str, image_id: str) -> tuple[int, int]:
+    """
+    Decode and open the image to confirm it's a valid RGB fundus image.
+    Returns (width, height). Raises RuntimeError if invalid.
+
+    This is intentionally lightweight — pixel preprocessing (resize, normalise)
+    happens on the RunPod worker alongside the model, keeping the two steps
+    co-located and avoiding a double encode/decode round-trip.
+    """
+    from PIL import Image as _Image
+
+    try:
+        img_bytes = base64.b64decode(image_b64)
+        img = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return img.size  # (w, h)
+    except Exception as e:
+        raise RuntimeError(f"[{image_id}] Invalid image: {e}") from e
 
 
 # ---------------------------------------------------------------------------
 # FastMCP app
 # ---------------------------------------------------------------------------
-
-logger.info(f"Pre-warming model at module import (PID={os.getpid()}) ...")
-_get_model()
-logger.info("Model ready.")
-
-# Redis is required for background tasks to work across stateless HTTP requests.
-# Set FASTMCP_DOCKET_URL=redis://... in your deployment environment variables.
-_redis_url = os.environ.get("FASTMCP_DOCKET_URL")
-if not _redis_url:
-    logger.warning(
-        "FASTMCP_DOCKET_URL is not set — background tasks will fail across "
-        "stateless HTTP requests. Set this to your Redis URL in env vars."
-    )
 
 mcp = FastMCP("fundus-cup-disc")
 
@@ -115,7 +170,9 @@ async def segment_cup_disc(
     progress: Progress = Progress(),
 ) -> str:
     """
-    Run SegFormer optic cup and disc segmentation as a background task.
+    Run SegFormer optic cup and disc segmentation on a fundus image.
+
+    Image validation runs locally; GPU inference is dispatched to RunPod.
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
@@ -125,76 +182,37 @@ async def segment_cup_disc(
         JSON with disc/cup pixel counts, CDR, and base64-encoded NPZ
         containing disc_annulus, cup, full_disc, and cd_raw arrays.
 
-    Label map:
+    Label map (from RunPod worker):
         0 = background
         1 = disc annulus (outer ring, excludes cup)
         2 = optic cup
     """
-    import torch
-    import torch.nn.functional as F
-    import numpy as np
-    from PIL import Image as _Image
-    from datetime import datetime
-
     try:
         await progress.set_total(3)
+        await progress.set_message("Validating image...")
 
-        await progress.set_message("Loading model...")
-        model, processor, device = _get_model()
+        try:
+            w, h = _validate_image(image_b64, image_id)
+        except RuntimeError as e:
+            return json.dumps({"success": False, "reason": str(e)})
 
-        await progress.set_message("Preprocessing image...")
-        img_bytes = base64.b64decode(image_b64)
-        image     = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        w, h      = image.size
-
-        inputs = processor(image, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        logger.info(f"[{image_id}] Image validated: {w}x{h}")
         await progress.increment()
 
-        await progress.set_message("Running segmentation inference...")
-        with torch.no_grad():
-            logits = model(**inputs).logits
+        await progress.set_message("Running cup/disc segmentation on RunPod...")
+        output = _runpod_dispatch(image_id, image_b64)
         await progress.increment()
 
-        await progress.set_message("Computing mask statistics...")
-        upsampled = F.interpolate(logits, size=(h, w), mode="bilinear",
-                                  align_corners=False)
-        cd_raw    = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
-
-        disc_annulus = (cd_raw == 1).astype(np.uint8)
-        cup          = (cd_raw == 2).astype(np.uint8)
-        full_disc    = (cd_raw >= 1).astype(np.uint8)
-
-        cup_px  = int(cup.sum())
-        disc_px = int(full_disc.sum())
-        cdr     = round(cup_px / disc_px, 4) if disc_px > 0 else 0.0
-
-        # Encode masks as base64 NPZ
-        npz_buf = io.BytesIO()
-        np.savez_compressed(
-            npz_buf,
-            disc_annulus=disc_annulus,
-            cup=cup,
-            full_disc=full_disc,
-            cd_raw=cd_raw,
+        await progress.set_message("Done.")
+        logger.info(
+            f"[{image_id}] CDR={output.get('cdr')}  "
+            f"payload≈{len(output.get('masks_b64', '')) / 1024:.1f}KB"
         )
-        masks_b64 = base64.b64encode(npz_buf.getvalue()).decode()
-
-        payload = json.dumps({
-            "success":               True,
-            "image_id":              image_id,
-            "shape":                 list(cd_raw.shape),
-            "disc_pixel_count":      int(disc_annulus.sum()),
-            "cup_pixel_count":       cup_px,
-            "full_disc_pixel_count": disc_px,
-            "cdr":                   cdr,
-            "masks_b64":             masks_b64,
-            "model":                 str(WEIGHTS_FILE.name),
-            "created_at":            datetime.utcnow().isoformat() + "Z",
-        })
-        logger.info(f"segment_cup_disc: {image_id}  CDR={cdr}  payload={len(payload)/1024:.1f}KB")
         await progress.increment()
-        return payload
+
+        # Pass the RunPod output straight through — it already contains the
+        # full payload (pixel counts, CDR, masks_b64, shape, created_at).
+        return json.dumps(output)
 
     except Exception as e:
         logger.error(f"segment_cup_disc failed: {e}", exc_info=True)
@@ -203,13 +221,15 @@ async def segment_cup_disc(
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe. Reports whether model weights and /tmp cache are present."""
+    """Liveness probe. Reports RunPod endpoint configuration status."""
     return json.dumps({
-        "status":         "ok",
-        "service":        "fundus-cup-disc",
-        "weights_file":   str(WEIGHTS_FILE),
-        "weights_exists": WEIGHTS_FILE.exists(),
-        "tmp_cache":      TMP_CACHE_DIR.exists(),
+        "status":  "ok",
+        "service": "fundus-cup-disc",
+        "runpod": {
+            "endpoint_url":    RUNPOD_ENDPOINT_URL or "(not set)",
+            "api_key_present": bool(RUNPOD_API_KEY),
+            "configured":      bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_URL),
+        },
     })
 
 
