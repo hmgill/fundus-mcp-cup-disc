@@ -4,9 +4,8 @@ server.py — fundus-mcp-cup-disc
 FastMCP server exposing SegFormer optic cup/disc segmentation as an MCP tool,
 deployed via Prefect Horizon.
 
-Preprocessing (base64 decode + PIL validation) runs locally; GPU inference is
-dispatched to a RunPod serverless endpoint so Horizon doesn't need a GPU or
-model weights.
+Image validation runs locally; GPU inference is dispatched to a RunPod
+serverless endpoint so Horizon doesn't need a GPU or model weights.
 
 Required environment variables:
     RUNPOD_API_KEY       RunPod API key
@@ -25,6 +24,12 @@ Tools:
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Only stdlib + fastmcp at the top level.
+# `requests` and `pillow` are imported lazily inside functions so that
+# `fastmcp inspect` (which runs in a minimal build env with only fastmcp
+# installed) can parse the tool signatures without hitting ModuleNotFoundError.
+# ---------------------------------------------------------------------------
 import base64
 import io
 import json
@@ -33,7 +38,6 @@ import os
 import time
 from datetime import timedelta
 
-import requests
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
 from fastmcp.server.tasks import TaskConfig
@@ -43,24 +47,17 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — read lazily at call time so missing env vars don't emit warnings
+# (or cause failures) during `fastmcp inspect` at build time.
 # ---------------------------------------------------------------------------
 
-RUNPOD_API_KEY       = os.environ.get("RUNPOD_API_KEY", "")
-RUNPOD_ENDPOINT_URL  = os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/")
-RUNPOD_POLL_INTERVAL = int(os.environ.get("RUNPOD_POLL_INTERVAL", "3"))
-RUNPOD_MAX_WAIT      = int(os.environ.get("RUNPOD_MAX_WAIT", "120"))
-
-if not RUNPOD_API_KEY:
-    logger.warning("RUNPOD_API_KEY is not set — inference calls will fail.")
-if not RUNPOD_ENDPOINT_URL:
-    logger.warning("RUNPOD_ENDPOINT_URL is not set — inference calls will fail.")
-
-_redis_url = os.environ.get("FASTMCP_DOCKET_URL")
-if not _redis_url:
-    logger.warning(
-        "FASTMCP_DOCKET_URL is not set — background tasks will fail across "
-        "stateless HTTP requests. Set this to your Redis URL in Horizon env vars."
+def _cfg() -> tuple[str, str, int, int]:
+    """Return (api_key, endpoint_url, poll_interval, max_wait) from env."""
+    return (
+        os.environ.get("RUNPOD_API_KEY", ""),
+        os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/"),
+        int(os.environ.get("RUNPOD_POLL_INTERVAL", "3")),
+        int(os.environ.get("RUNPOD_MAX_WAIT", "120")),
     )
 
 
@@ -68,11 +65,14 @@ if not _redis_url:
 # RunPod client
 # ---------------------------------------------------------------------------
 
-def _runpod_session() -> requests.Session:
+def _runpod_session():
     """Return a requests Session pre-configured with RunPod auth headers."""
+    import requests  # lazy import — not available during fastmcp inspect
+
+    api_key, _, _, _ = _cfg()
     session = requests.Session()
     session.headers.update({
-        "Authorization": f"Bearer {RUNPOD_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
     })
     return session
@@ -91,10 +91,17 @@ def _runpod_dispatch(image_id: str, image_b64: str) -> dict:
         The output dict from RunPod on success.
         Raises RuntimeError on job failure or TimeoutError on timeout.
     """
+    api_key, endpoint_url, poll_interval, max_wait = _cfg()
+
+    if not api_key:
+        raise RuntimeError("RUNPOD_API_KEY is not set.")
+    if not endpoint_url:
+        raise RuntimeError("RUNPOD_ENDPOINT_URL is not set.")
+
     session = _runpod_session()
 
     resp = session.post(
-        f"{RUNPOD_ENDPOINT_URL}/run",
+        f"{endpoint_url}/run",
         json={"input": {
             "image_id":  image_id,
             "image_b64": image_b64,
@@ -106,9 +113,9 @@ def _runpod_dispatch(image_id: str, image_b64: str) -> dict:
         raise RuntimeError(f"No job ID in RunPod response: {resp.json()}")
     logger.info(f"[{image_id}] RunPod job submitted: {job_id}")
 
-    deadline = time.time() + RUNPOD_MAX_WAIT
+    deadline = time.time() + max_wait
     while time.time() < deadline:
-        resp = session.get(f"{RUNPOD_ENDPOINT_URL}/status/{job_id}")
+        resp = session.get(f"{endpoint_url}/status/{job_id}")
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status")
@@ -122,27 +129,27 @@ def _runpod_dispatch(image_id: str, image_b64: str) -> dict:
             return output
         if status == "FAILED":
             raise RuntimeError(f"RunPod job failed: {data.get('error')}")
-        time.sleep(RUNPOD_POLL_INTERVAL)
+        time.sleep(poll_interval)
 
     raise TimeoutError(
-        f"RunPod job {job_id} did not complete within {RUNPOD_MAX_WAIT}s"
+        f"RunPod job {job_id} did not complete within {max_wait}s"
     )
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing — runs locally on Horizon, no GPU needed
+# Image validation — runs locally on Horizon, no GPU needed
 # ---------------------------------------------------------------------------
 
 def _validate_image(image_b64: str, image_id: str) -> tuple[int, int]:
     """
-    Decode and open the image to confirm it's a valid RGB fundus image.
+    Decode and open the image to confirm it is a valid RGB fundus image.
     Returns (width, height). Raises RuntimeError if invalid.
 
-    This is intentionally lightweight — pixel preprocessing (resize, normalise)
-    happens on the RunPod worker alongside the model, keeping the two steps
-    co-located and avoiding a double encode/decode round-trip.
+    Pixel preprocessing (resize, normalise) happens on the RunPod worker
+    alongside the model, keeping both steps co-located and avoiding a
+    double encode/decode round-trip.
     """
-    from PIL import Image as _Image
+    from PIL import Image as _Image  # lazy import
 
     try:
         img_bytes = base64.b64decode(image_b64)
@@ -222,13 +229,14 @@ async def segment_cup_disc(
 @mcp.tool()
 async def health() -> str:
     """Liveness probe. Reports RunPod endpoint configuration status."""
+    api_key, endpoint_url, _, _ = _cfg()
     return json.dumps({
         "status":  "ok",
         "service": "fundus-cup-disc",
         "runpod": {
-            "endpoint_url":    RUNPOD_ENDPOINT_URL or "(not set)",
-            "api_key_present": bool(RUNPOD_API_KEY),
-            "configured":      bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_URL),
+            "endpoint_url":    endpoint_url or "(not set)",
+            "api_key_present": bool(api_key),
+            "configured":      bool(api_key and endpoint_url),
         },
     })
 
