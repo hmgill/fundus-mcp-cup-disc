@@ -15,50 +15,29 @@ Optional environment variables:
     FASTMCP_DOCKET_URL  rediss://<host>:<port>  Redis for background tasks
 
 Tools:
-    segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ  [background task]
+    segment_cup_disc(image_b64, image_id) → mask stats + base64 NPZ
     health()                              → liveness check
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Only stdlib + fastmcp at the top level.
-# `requests` and `pillow` are imported lazily inside functions so that
-# `fastmcp inspect` (which runs in a minimal build env with only fastmcp
-# installed) can parse the tool signatures without hitting ModuleNotFoundError.
-# ---------------------------------------------------------------------------
 import io
 import json
 import logging
 import os
-from datetime import timedelta
 
 from fastmcp import FastMCP
-from fastmcp.dependencies import Progress
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Modal client — single blocking POST, no polling loop needed
+# Modal client — single blocking POST, no polling needed
 # ---------------------------------------------------------------------------
 
 def _modal_dispatch(image_id: str, image_b64: str) -> dict:
-    """
-    POST to the Modal /segment endpoint and block until inference completes.
-    Modal handles its own internal queueing and GPU scheduling.
-
-    Args:
-        image_id:   Identifier for logging and response correlation.
-        image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
-
-    Returns:
-        The output dict from Modal on success.
-        Raises RuntimeError on HTTP error or reported inference failure.
-        Raises TimeoutError if Modal does not respond within 120 seconds.
-    """
-    import requests  # lazy import — not available during fastmcp inspect
+    import requests
 
     endpoint_url = os.environ.get("MODAL_ENDPOINT_URL", "").rstrip("/")
     if not endpoint_url:
@@ -69,15 +48,13 @@ def _modal_dispatch(image_id: str, image_b64: str) -> dict:
     resp = requests.post(
         f"{endpoint_url}/segment",
         json={"image_id": image_id, "image_b64": image_b64},
-        timeout=120,  # Modal handles queueing internally; one blocking call is enough
+        timeout=120,
     )
     resp.raise_for_status()
     output = resp.json()
 
     if not output.get("success"):
-        raise RuntimeError(
-            f"Modal inference failed: {output.get('error')}"
-        )
+        raise RuntimeError(f"Modal inference failed: {output.get('error')}")
 
     logger.info(
         f"[{image_id}] CDR={output.get('cdr')}  "
@@ -87,21 +64,17 @@ def _modal_dispatch(image_id: str, image_b64: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Image validation — runs locally on Horizon, no GPU needed
+# Image validation — runs locally, no GPU needed
 # ---------------------------------------------------------------------------
 
 def _validate_image(image_b64: str, image_id: str) -> tuple[int, int]:
-    """
-    Decode and open the image to confirm it is a valid RGB fundus image.
-    Returns (width, height). Raises RuntimeError if invalid.
-    """
     import base64
-    from PIL import Image as _Image  # lazy import
+    from PIL import Image as _Image
 
     try:
         img_bytes = base64.b64decode(image_b64)
         img = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        return img.size  # (w, h)
+        return img.size
     except Exception as e:
         raise RuntimeError(f"[{image_id}] Invalid image: {e}") from e
 
@@ -118,11 +91,7 @@ mcp = FastMCP("fundus-cup-disc")
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def segment_cup_disc(
-    image_b64: str,
-    image_id: str,
-    progress: Progress = Progress(),
-) -> str:
+async def segment_cup_disc(image_b64: str, image_id: str) -> str:
     """
     Run SegFormer optic cup and disc segmentation on a fundus image.
 
@@ -142,26 +111,13 @@ async def segment_cup_disc(
         2 = optic cup
     """
     try:
-        await progress.set_total(3)
-        await progress.set_message("Validating image...")
-
         try:
             w, h = _validate_image(image_b64, image_id)
         except RuntimeError as e:
             return json.dumps({"success": False, "reason": str(e)})
 
         logger.info(f"[{image_id}] Image validated: {w}x{h}")
-        await progress.increment()
-
-        await progress.set_message("Running cup/disc segmentation on Modal...")
         output = _modal_dispatch(image_id, image_b64)
-        await progress.increment()
-
-        await progress.set_message("Done.")
-        await progress.increment()
-
-        # Pass the Modal output straight through — it already contains the
-        # full payload (pixel counts, CDR, masks_b64, shape, created_at).
         return json.dumps(output)
 
     except Exception as e:
